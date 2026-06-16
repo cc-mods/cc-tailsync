@@ -1,0 +1,30 @@
+# ---- private sync config (may hold a Tailscale IP + bearer token; NEVER commit) ----
+cc-sync.json
+**/cc-sync.json
+
+# ---- CrossCode save files / game data (never commit personal saves or game assets) ----
+*.save
+*.save.backup
+CrossCode/
+**/CrossCode/
+
+# ---- SwiftPM ----
+.build/
+.swiftpm/
+Package.resolved
+
+# ---- Python ----
+__pycache__/
+*.pyc
+
+# ---- macOS / editor cruft ----
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.vscode/
+
+# ---- misc ----
+*.log
+.env
+*.local
