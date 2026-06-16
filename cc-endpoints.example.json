@@ -1,8 +1,9 @@
 {
-  "_comment": "Copy this to cc-endpoints.json (git-ignored) and edit. Names you pick here become endpoint tokens for tools/save-manager.py, e.g. `save-manager.py push ios windows`. PREFER MagicDNS hostnames (http://<host>:8765) over 100.x Tailscale IPs — they're stable and keep IPs out of the file. A value can be a save-server URL string, or an object: {\"type\":\"server\",\"url\":\"...\",\"token\":\"...\"}, {\"type\":\"ios\",\"bundle_id\":\"...\"}, or {\"type\":\"local\",\"path\":\"...\"}. The built-in tokens local, ios, an http URL, and a file path always work without any config.",
+  "_comment": "Copy this to cc-endpoints.json (git-ignored) and edit. Names you pick here become endpoint tokens for tools/save-manager.py, e.g. `save-manager.py push ios windows`. PREFER MagicDNS hostnames over 100.x Tailscale IPs. A value can be a save-server URL string, or an object: {\"type\":\"server\",\"url\":\"...\",\"token\":\"...\"}, {\"type\":\"ssh\",\"host\":\"...\",\"user\":\"...\",\"path\":\"...\"}, {\"type\":\"ios\",\"bundle_id\":\"...\"}, or {\"type\":\"local\",\"path\":\"...\"}. Built-in tokens local, ios, an http(s) URL, an ssh://user@host/path URL, and a file path always work without any config.",
   "token": null,
   "endpoints": {
     "windows": "http://small:8765",
+    "windows-ssh": { "type": "ssh", "host": "small", "user": "you", "path": "C:/Users/you/AppData/Local/CrossCode/cc.save" },
     "mac": "http://milively-mbp-work:8765",
     "phone": { "type": "ios", "bundle_id": "com.example.ccios" }
   }

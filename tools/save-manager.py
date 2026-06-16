@@ -41,6 +41,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -389,6 +390,120 @@ class IosEndpoint:
                 os.remove(src)
 
 
+# ssh/scp binaries are overridable (lets tests inject shims; lets you point at a custom client).
+SSH_BIN = os.environ.get("CC_SSH", "ssh")
+SCP_BIN = os.environ.get("CC_SCP", "scp")
+
+
+class SshEndpoint:
+    """Another desktop reached over SSH, using scp to move the save (e.g. a Windows box running
+    OpenSSH Server, or a Mac/Linux with Remote Login on), all over Tailscale.
+
+    Transfers with scp: binary-safe, and `-p` makes the download carry the remote file's mtime onto
+    the local temp file so newest-wins works. The remote path must be the **literal** cc.save path
+    (give it in cc-endpoints.json so no remote shell expansion is needed), e.g. on Windows OpenSSH:
+    ``C:/Users/you/AppData/Local/CrossCode/cc.save`` (forward slashes are fine).
+
+    Note: scp is not atomic on the remote, so a forced push relies on the pre-write safety backup +
+    the post-write sha verification (which `push` does) to stay recoverable.
+    """
+
+    kind = "ssh"
+
+    def __init__(self, host, path, user=None, port=None, identity=None, name=None):
+        self.host = host
+        self.path = path
+        self.user = user
+        self.port = port
+        self.identity = identity
+        self.name = name or (f"{user}@{host}" if user else host)
+
+    def _target(self):
+        return f"{self.user}@{self.host}" if self.user else self.host
+
+    def _remote(self):
+        return f"{self._target()}:{self.path}"
+
+    def describe(self):
+        return f"{self.name} (ssh {self._target()}:{self.path})"
+
+    def _scp_opts(self):
+        args = ["-q", "-p", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+        if self.port:
+            args += ["-P", str(self.port)]
+        if self.identity:
+            args += ["-i", os.path.expanduser(self.identity)]
+        return args
+
+    def _run(self, args):
+        try:
+            return subprocess.run(args, capture_output=True, text=True, timeout=90)
+        except FileNotFoundError:
+            raise EndpointError(f"ssh: '{args[0]}' not found on PATH")
+        except subprocess.TimeoutExpired:
+            raise EndpointError(f"{self.describe()}: timed out (host unreachable?)")
+
+    @staticmethod
+    def _looks_missing(stderr):
+        s = (stderr or "").lower()
+        return any(p in s for p in ("no such file", "not a regular file",
+                                    "does not exist", "couldn't stat", "cannot stat"))
+
+    def read(self):
+        dest = tempfile.mktemp(suffix=".save")
+        r = self._run([SCP_BIN, *self._scp_opts(), self._remote(), dest])
+        try:
+            if r.returncode != 0:
+                if self._looks_missing(r.stderr):
+                    raise EndpointError(f"{self.describe()}: no save at that path")
+                raise EndpointError(f"{self.describe()}: scp download failed: {r.stderr.strip()[:200]}")
+            if not os.path.exists(dest) or os.path.getsize(dest) == 0:
+                raise EndpointError(f"{self.describe()}: downloaded an empty file")
+            data = open(dest, "rb").read()
+            mtime = int(os.stat(dest).st_mtime)  # scp -p carried the remote mtime onto the temp
+        finally:
+            if os.path.exists(dest):
+                os.remove(dest)
+        return Blob(data, mtime)
+
+    def info(self):
+        # Distinguish "reachable but no save" (-> exists False) from "unreachable/auth/scp error"
+        # (-> raise), so safety_backup never silently skips a real save before an overwrite.
+        try:
+            blob = self.read()
+        except EndpointError as e:
+            if "no save at that path" in str(e).lower():
+                return {"exists": False, "size": 0, "mtime": 0, "sha256": ""}
+            raise
+        return {"exists": True, "size": blob.size, "mtime": blob.mtime, "sha256": blob.sha}
+
+    def write(self, blob):
+        src = tempfile.mktemp(suffix=".save")
+        with open(src, "wb") as f:
+            f.write(blob.data)
+        try:
+            r = self._run([SCP_BIN, *self._scp_opts(), src, self._remote()])
+            if r.returncode != 0:
+                raise EndpointError(f"{self.describe()}: scp upload failed: {r.stderr.strip()[:200]}")
+        finally:
+            if os.path.exists(src):
+                os.remove(src)
+
+
+def _parse_ssh_url(token):
+    """ssh://[user@]host[:port]/remote/path  (Windows drive paths: ssh://you@host/C:/path/cc.save)."""
+    from urllib.parse import urlparse
+    u = urlparse(token)
+    if not u.hostname:
+        raise EndpointError(f"bad ssh url '{token}' — use ssh://user@host/path/to/cc.save")
+    path = u.path
+    if re.match(r"^/[A-Za-z]:/", path):   # '/C:/Users/...' -> 'C:/Users/...'
+        path = path[1:]
+    if not path:
+        raise EndpointError(f"ssh url '{token}' needs a remote file path")
+    return SshEndpoint(u.hostname, path, user=u.username, port=u.port)
+
+
 # --------------------------------------------------------------------------- config / resolution
 
 def find_config():
@@ -426,6 +541,11 @@ def resolve(token, config, global_token=None):
                 return ServerEndpoint(spec["url"], spec.get("token", cfg_token), name=token)
             if t == "ios":
                 return IosEndpoint(spec.get("bundle_id", IOS_BUNDLE_ID), spec.get("device"), name=token)
+            if t == "ssh" or spec.get("host"):   # before the path-based local check (ssh specs have 'path' too)
+                if not spec.get("host") or not spec.get("path"):
+                    raise EndpointError(f"endpoint '{token}': ssh needs both 'host' and 'path'")
+                return SshEndpoint(spec["host"], spec["path"], spec.get("user"),
+                                   spec.get("port"), spec.get("identity"), name=token)
             if t == "local" or spec.get("path"):
                 return LocalEndpoint(spec.get("path", default_save_path()), name=token)
         raise EndpointError(f"endpoint '{token}' in config is malformed")
@@ -441,11 +561,13 @@ def _bareword(token, cfg_token):
         return IosEndpoint(name="ios")
     if token.startswith("http://") or token.startswith("https://"):
         return ServerEndpoint(token, cfg_token)
+    if token.startswith("ssh://"):
+        return _parse_ssh_url(token)
     if token.startswith(("/", "./", "../", "~")) or token.endswith(".save"):
         return LocalEndpoint(token, name=token)
     raise EndpointError(
-        f"unknown endpoint '{token}'. Use: local, ios, an http://host:port URL, a file path, "
-        f"or a name from cc-endpoints.json.")
+        f"unknown endpoint '{token}'. Use: local, ios, an http://host:port URL, an "
+        f"ssh://user@host/path URL, a file path, or a name from cc-endpoints.json.")
 
 
 # --------------------------------------------------------------------------- helpers
@@ -687,7 +809,7 @@ def cmd_restore(args, config):
 
 def cmd_endpoints(args, config):
     eps = config.get("endpoints", {}) if isinstance(config, dict) else {}
-    print("Built-in: local, ios, <http://host:port>, <file path>")
+    print("Built-in: local, ios, <http://host:port>, <ssh://user@host/path>, <file path>")
     if not eps:
         print("No cc-endpoints.json found. Create one to name your remotes, e.g.:")
         print('  { "endpoints": { "windows": "http://100.100.0.21:8765",')
@@ -704,9 +826,9 @@ def cmd_endpoints(args, config):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="save-manager.py",
-        description="Force/sync a CrossCode save between desktop(s) and a USB iPhone (cc-tailsync).",
+        description="Force/sync a CrossCode save between desktop(s), a USB iPhone, and SSH hosts (cc-tailsync).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Endpoints: local | ios | http://host:port | /path/to/cc.save | <name from cc-endpoints.json>")
+        epilog="Endpoints: local | ios | http://host:port | ssh://user@host/path | /path/to/cc.save | <name from cc-endpoints.json>")
     p.add_argument("--token", help="bearer token for server endpoints (overrides config)")
     p.add_argument("--dir", default=default_backups_dir(),
                    help="snapshot dir for backup/list/restore (default: a cc-tailsync-backups "

@@ -103,6 +103,7 @@ Each platform is an **endpoint**:
 | `local` | this machine's desktop CrossCode save (auto-detected per OS) | anywhere |
 | `ios` | a USB-connected iPhone running cc-ios (`xcrun devicectl`) | macOS only |
 | `http://host:port` | another desktop running `save-server.py`, over your tailnet | anywhere |
+| `ssh://user@host/path` | another desktop over SSH/scp — **no save-server needed** | anywhere |
 | `<name>` | a friendly alias from `cc-endpoints.json` | anywhere |
 
 ```bash
@@ -113,6 +114,7 @@ tools/save-manager.py status local ios windows
 tools/save-manager.py push ios local       # phone   -> this Mac
 tools/save-manager.py push local windows    # this Mac -> the Windows desktop (its save-server)
 tools/save-manager.py push windows ios       # Windows  -> phone   (run on the Mac; routes via USB)
+tools/save-manager.py push ios windows-ssh    # phone   -> Windows over SSH/scp (no save-server)
 
 # or let it pick the newer side
 tools/save-manager.py sync local windows

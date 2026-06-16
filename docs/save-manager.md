@@ -20,8 +20,46 @@ An *endpoint* is any place a save lives. Pass these as `save-manager.py` argumen
 | `local` (`desktop`, `this`) | this machine's desktop CrossCode save | everywhere |
 | `ios` (`iphone`, `phone`) | a USB-connected iPhone running cc-ios, via `xcrun devicectl` | **macOS only** |
 | `http://host:port` | another desktop running `save-server.py` (reach it over Tailscale) | everywhere |
+| `ssh://user@host/path` | another desktop reached over SSH (scp the save) — **no save-server needed** | everywhere |
 | `/path/to/cc.save` | an explicit file | everywhere |
 | `<name>` | an alias from `cc-endpoints.json` (resolves to one of the above) | everywhere |
+
+### SSH endpoints (serverless desktop ↔ desktop)
+
+An `ssh` endpoint moves the save with **scp** — no long-running save-server required on the other
+desktop, just an SSH server it can reach over Tailscale (Windows **OpenSSH Server**, or macOS/Linux
+**Remote Login**). Give the **literal** remote save path so there's no remote shell expansion:
+
+```json
+{
+  "endpoints": {
+    "windows-ssh": { "type": "ssh", "host": "small", "user": "you",
+                     "path": "C:/Users/you/AppData/Local/CrossCode/cc.save" }
+  }
+}
+```
+
+or inline as a URL: `ssh://you@small/C:/Users/you/AppData/Local/CrossCode/cc.save`. Optional
+`port` and `identity` (private-key path) are supported. Then:
+
+```bash
+save-manager.py push ios windows-ssh     # phone -> Windows, straight over scp (run on the Mac)
+save-manager.py push windows-ssh local    # Windows -> this Mac
+save-manager.py sync local windows-ssh     # newest-wins
+```
+
+scp is binary-safe and `-p` carries the remote mtime so newest-wins works. It is **not atomic on the
+remote**, so a forced push leans on the pre-write safety backup + `push`'s post-write sha verify
+(which it always does). **Enable Windows OpenSSH Server** (one-time, admin PowerShell):
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd
+Set-Service sshd -StartupType Automatic
+```
+
+Then `ssh you@small` works over Tailscale and the `ssh` endpoint is live. (Set up key auth so scp
+runs unattended — `BatchMode` is on, so password-only servers will fail fast rather than hang.)
 
 ### Naming your machines
 
@@ -118,13 +156,14 @@ py tools\save-manager.py sync local mac       # reconcile, newest wins
 ## Requirements & limits
 
 - **Python 3** on PATH (`python3` on macOS/Linux, `python`/`py` on Windows). No third-party packages.
-- **Reaching another desktop** needs its `save-server.py` running and reachable (Tailscale). Start it
-  persistently with `servers/macos/save-server.sh install` or `servers\windows\save-server.ps1 install`.
+- **Reaching another desktop** — two ways: run its `save-server.py` and use an `http://` endpoint, or
+  enable its SSH server and use an `ssh://` endpoint (no server process needed). `scp`/`ssh` must be
+  on PATH for SSH endpoints (built in on macOS/Linux and Windows 10+).
 - **Reaching iOS** needs the iPhone connected by **USB to a Mac** with Xcode tools (`xcrun devicectl`)
-  and unlocked. So **iOS ↔ Windows** transfers route through the Mac, or through the phone's own
-  wireless sync to a hub.
+  and unlocked — iOS can't be an SSH/HTTP *server*. So **iOS ↔ Windows** transfers route through the
+  Mac (e.g. `push ios windows-ssh` run on the Mac), or through the phone's own wireless sync to a hub.
 - iOS mtime is read from the on-device file's `lastModDate`; desktop mtime from the filesystem; the
-  server reports `mtime` in `/status`. All are epoch-comparable for newest-wins.
+  server reports `mtime` in `/status`; SSH mtime comes from `scp -p`. All are epoch-comparable.
 
 ## Tests
 

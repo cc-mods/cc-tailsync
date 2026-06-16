@@ -14,11 +14,41 @@ import subprocess
 import sys
 import tempfile
 import time
+import hashlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MANAGER = os.path.join(HERE, "save-manager.py")
 SERVER = os.path.join(HERE, "..", "servers", "save-server.py")
 PY = sys.executable
+
+# A fake `scp`: operates on local files so the SSH endpoint's read/write/mtime/exists logic can be
+# tested with no real server. Maps a remote spec `user@host:/path` to the local `/path`; honors -p
+# (preserve mtime) so newest-wins is exercised; emits a missing-file error like real scp.
+FAKE_SCP = r'''#!/usr/bin/env python3
+import os, sys, shutil
+args = sys.argv[1:]
+preserve = False
+pos = []
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "-q":
+        i += 1; continue
+    if a == "-p":
+        preserve = True; i += 1; continue
+    if a in ("-P", "-i", "-o"):
+        i += 2; continue
+    pos.append(a); i += 1
+src, dst = pos[0], pos[1]
+def rp(p):
+    return p.split(":", 1)[1] if ":" in p else p
+s, d = rp(src), rp(dst)
+if not os.path.exists(s):
+    sys.stderr.write("scp: %s: No such file or directory\n" % s)
+    sys.exit(1)
+os.makedirs(os.path.dirname(d) or ".", exist_ok=True)
+shutil.copy2(s, d) if preserve else shutil.copyfile(s, d)
+'''
 
 _fails = []
 _passes = 0
@@ -38,6 +68,10 @@ def save_blob(tag):
     """A minimally-valid CrossCode save (top-level 'slots'), unique per tag."""
     return json.dumps({"slots": [f"slot-{tag}"], "autoSlot": None,
                        "lastSlot": 0, "globals": tag}).encode("utf-8")
+
+
+def blob_sha(tag):
+    return hashlib.sha256(save_blob(tag)).hexdigest()
 
 
 def free_port():
@@ -192,6 +226,49 @@ def main():
         dst2 = os.path.join(work, "from-git.save")
         r = manager("--dir", gitwork, "restore", "latest", dst2, "-y", "--pull")
         check("restore latest from git-backed repo", r.returncode == 0 and open(dst2, "rb").read() == save_blob("F"),
+              r.stdout + r.stderr)
+
+        # 15-19. SSH endpoint via a fake-scp shim (no real server needed)
+        fake_scp = os.path.join(work, "fake-scp.py")
+        open(fake_scp, "w").write(FAKE_SCP)
+        os.chmod(fake_scp, 0o755)
+        remote_root = os.path.join(work, "remoteroot")
+        os.makedirs(remote_root, exist_ok=True)
+        remote_save = os.path.join(remote_root, "cc.save")
+        sshcfg = os.path.join(work, "ssh-endpoints.json")
+        json.dump({"endpoints": {"win": {"type": "ssh", "host": "dummy", "user": "me", "path": remote_save}}},
+                  open(sshcfg, "w"))
+        sshenv = {"CC_ENDPOINTS": sshcfg, "CC_SCP": fake_scp}
+
+        r = manager("status", "win", env=sshenv)
+        check("ssh status: no save when remote missing", "no save" in r.stdout, r.stdout + r.stderr)
+
+        open(local_save, "wb").write(save_blob("S"))
+        r = manager("push", local_save, "win", "-y", env=sshenv)
+        check("push local->ssh ok", r.returncode == 0 and "MATCH" in r.stdout, r.stdout + r.stderr)
+        check("ssh remote received save",
+              os.path.isfile(remote_save) and open(remote_save, "rb").read() == save_blob("S"))
+
+        r = manager("status", "win", env=sshenv)
+        check("ssh status shows correct sha after push", blob_sha("S")[:12] in r.stdout, r.stdout)
+
+        out_ssh = os.path.join(work, "from-ssh.save")
+        r = manager("push", "win", out_ssh, "-y", env=sshenv)
+        check("push ssh->local ok", r.returncode == 0 and open(out_ssh, "rb").read() == save_blob("S"),
+              r.stdout + r.stderr)
+
+        # newest-wins: make the ssh remote newer -> local receives it
+        open(remote_save, "wb").write(save_blob("T"))
+        os.utime(remote_save, (time.time() + 500, time.time() + 500))
+        open(local_save, "wb").write(save_blob("S"))
+        os.utime(local_save, (time.time() - 500, time.time() - 500))
+        r = manager("sync", local_save, "win", "-y", env=sshenv)
+        check("sync pulls newer ssh remote", open(local_save, "rb").read() == save_blob("T"), r.stdout + r.stderr)
+
+        # ssh:// URL form resolves (remote_save is an absolute unix path)
+        r = manager("status", f"ssh://me@dummy{remote_save}",
+                    env={"CC_ENDPOINTS": os.devnull, "CC_SCP": fake_scp})
+        check("ssh:// url form resolves", r.returncode == 0 and blob_sha("T")[:12] in r.stdout,
               r.stdout + r.stderr)
 
     finally:

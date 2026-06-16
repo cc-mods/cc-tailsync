@@ -85,19 +85,41 @@ the HTTP save-server (§2) is still the better path. Taildrop is in public alpha
 - If a key already expired, on that machine: `tailscale up --force-reauth` (interactive; never run it
   over a remote shell — it drops the connection).
 
-## 5. SSH between your machines (optional)
+## 5. Remote access / SSH between your machines
 
-Tailscale SSH can host **only** Linux and the macOS open-source `tailscaled` build — **Windows cannot
-be a Tailscale SSH host**, and the macOS Standalone/App-Store apps can't either. You can still use
-each OS's normal SSH server over the tailnet. To use Tailscale SSH where supported:
+Two different things people mean by "SSH over Tailscale" — don't confuse them:
+
+- **Tailscale SSH** (the built-in `tailscale set --ssh` feature, where *Tailscale* brokers the auth)
+  can be **hosted only on Linux and the macOS open-source `tailscaled` build**. **Windows cannot be a
+  Tailscale-SSH host**, and the macOS App-Store/Standalone apps can't either.
+- **Plain SSH / RDP to a machine, carried over Tailscale** — this works for **every** platform,
+  because Tailscale is just the (encrypted) network path. This is what people use for "full remote
+  control": **RDP** to Windows (port 3389), or each OS's **normal SSH server**.
+
+So you absolutely *can* SSH into your Windows box over Tailscale — you just enable **Windows OpenSSH
+Server** (it's an optional Windows feature), which is independent of Tailscale SSH:
+
+```powershell
+# One-time, in an Administrator PowerShell on the Windows box:
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd
+Set-Service sshd -StartupType Automatic
+```
+
+Then from the Mac: `ssh you@small` (MagicDNS name) over the tailnet. Set up key auth for unattended
+use. This is exactly what the **save-manager `ssh://` endpoint** uses to drop a save onto Windows
+with no save-server — see [`save-manager.md`](save-manager.md). For full GUI control instead, enable
+**Remote Desktop** on Windows and connect to `small:3389` over Tailscale.
+
+On macOS/Linux you can use the real Tailscale SSH feature where supported:
 
 ```bash
 tailscale set --ssh          # on a Linux / tailscaled-macOS host
 ssh you@<host>               # from any device, by MagicDNS name
 ```
 
-…plus an `ssh` rule in the tailnet policy (admin console → **Access controls**). For a 3-device
-personal tailnet this is optional; cc-tailsync never requires SSH.
+…plus an `ssh` rule in the tailnet policy (admin console → **Access controls**). cc-tailsync never
+*requires* SSH; it's an optional serverless transport for desktop↔desktop save moves.
 
 ## 6. Locking it down (optional)
 
