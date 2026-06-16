@@ -69,6 +69,68 @@ IOS_BUNDLE_ID = os.environ.get("CCIOS_BUNDLE_ID", "com.example.ccios")
 IOS_CONTAINER_SAVE = "Documents/cc.save"
 
 
+def default_backups_dir():
+    """Where snapshots live for backup/list/restore.
+
+    Prefers a checkout of the private **cc-tailsync-backups** org repo (so snapshots are durable,
+    versioned, and off-device) if one is found next to this repo or under ~/.cc-tailsync; otherwise
+    falls back to a plain local folder. Override with $CC_BACKUPS_DIR or --dir.
+    """
+    env = os.environ.get("CC_BACKUPS_DIR")
+    if env:
+        return os.path.expanduser(env)
+    here = os.path.dirname(os.path.abspath(__file__))          # .../cc-tailsync/tools
+    repo_root = os.path.dirname(here)                          # .../cc-tailsync
+    for c in [os.path.join(os.path.dirname(repo_root), "cc-tailsync-backups"),
+              os.path.expanduser("~/.cc-tailsync/cc-tailsync-backups")]:
+        if os.path.isdir(os.path.join(c, ".git")):
+            return c
+    return os.path.expanduser("~/.cc-tailsync/backups")
+
+
+# --------------------------------------------------------------------------- git (backups repo)
+
+def is_git_repo(d):
+    return os.path.isdir(os.path.join(os.path.expanduser(d), ".git"))
+
+
+def _git(d, *args, check=True):
+    r = subprocess.run(["git", "-C", os.path.expanduser(d), *args],
+                       capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise EndpointError(f"git {' '.join(args)} failed: {(r.stderr or r.stdout).strip()[:200]}")
+    return r
+
+
+def git_pull(d):
+    """Best-effort fast-forward pull (no-op if not a git repo or no remote)."""
+    if is_git_repo(d):
+        _git(d, "pull", "--ff-only", "--quiet", check=False)
+
+
+def git_commit_push(d, message):
+    """Commit new snapshots and push. Coordinates with other agents (rebase) and never force-pushes.
+
+    Returns a short status string for printing. Tolerates 'nothing to commit' and a missing remote.
+    """
+    if not is_git_repo(d):
+        return "not a git repo — snapshot saved locally only (point --dir at a cc-tailsync-backups clone to version it)"
+    _git(d, "add", "-A")
+    r = _git(d, "commit", "-m", message, check=False)
+    if r.returncode != 0:
+        if "nothing to commit" in (r.stdout + r.stderr):
+            return "nothing new to commit"
+        return f"commit skipped ({(r.stderr or r.stdout).strip()[:120]})"
+    # Pull-rebase before push (multi-agent safe), then push if a remote exists.
+    has_remote = _git(d, "remote", check=False).stdout.strip() != ""
+    if has_remote:
+        _git(d, "pull", "--rebase", "--quiet", check=False)
+        p = _git(d, "push", "--quiet", check=False)
+        return "committed + pushed" if p.returncode == 0 else "committed locally (push failed — check the remote/auth)"
+    return "committed locally (no remote configured)"
+
+
+
 class EndpointError(Exception):
     """A user-facing problem reaching or using an endpoint."""
 
@@ -539,6 +601,8 @@ def cmd_backup(args, config):
     ep = resolve(args.endpoint, config, args.token)
     blob = ep.read()
     base = os.path.expanduser(args.dir)
+    if args.push:
+        git_pull(base)  # start from latest so our commit is additive
     label = args.label or ep.kind
     snap = os.path.join(base, "snapshots", f"{stamp_utc()}-{label}")
     os.makedirs(snap, exist_ok=True)
@@ -554,6 +618,13 @@ def cmd_backup(args, config):
     shutil.copy2(os.path.join(snap, "cc.save"), os.path.join(latest, "cc.save"))
     json.dump(meta, open(os.path.join(latest, "meta.json"), "w"), indent=2)
     print(f"backed up {ep.describe()} -> {snap}  ({blob.size} b, sha {blob.sha[:12]})")
+    if args.push:
+        status = git_commit_push(base, f"backup({label}): cc.save {os.path.basename(snap)} "
+                                       f"({blob.size}b, sha {blob.sha[:12]})\n\n"
+                                       f"Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>")
+        print(f"  git: {status}")
+    elif is_git_repo(base):
+        print("  (this is a git-backed backups repo — add --push to commit + push the snapshot)")
     return 0
 
 
@@ -570,6 +641,8 @@ def _snapshots(base):
 
 
 def cmd_list(args, config):
+    if args.pull:
+        git_pull(os.path.expanduser(args.dir))
     snaps = _snapshots(args.dir)
     if not snaps:
         print(f"no snapshots under {os.path.expanduser(args.dir)}/snapshots")
@@ -580,6 +653,8 @@ def cmd_list(args, config):
 
 
 def cmd_restore(args, config):
+    if args.pull:
+        git_pull(os.path.expanduser(args.dir))
     snaps = _snapshots(args.dir)
     pick = None
     if args.which == "latest":
@@ -633,8 +708,9 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Endpoints: local | ios | http://host:port | /path/to/cc.save | <name from cc-endpoints.json>")
     p.add_argument("--token", help="bearer token for server endpoints (overrides config)")
-    p.add_argument("--dir", default="~/.cc-tailsync/backups",
-                   help="snapshot dir for backup/list/restore (default: ~/.cc-tailsync/backups)")
+    p.add_argument("--dir", default=default_backups_dir(),
+                   help="snapshot dir for backup/list/restore (default: a cc-tailsync-backups "
+                        "checkout if found, else ~/.cc-tailsync/backups)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("status", help="show each endpoint's save + verdict")
@@ -659,9 +735,12 @@ def build_parser():
     s = sub.add_parser("backup", help="snapshot an endpoint into the backups layout")
     s.add_argument("endpoint")
     s.add_argument("--label", help="snapshot label (default: endpoint kind)")
+    s.add_argument("--push", action="store_true",
+                   help="commit + push the snapshot (when --dir is a cc-tailsync-backups git clone)")
     s.set_defaults(func=cmd_backup)
 
     s = sub.add_parser("list", help="list local snapshots")
+    s.add_argument("--pull", action="store_true", help="git pull the backups repo first")
     s.set_defaults(func=cmd_list)
 
     s = sub.add_parser("restore", help="restore a snapshot to an endpoint")
@@ -669,6 +748,7 @@ def build_parser():
     s.add_argument("dst")
     s.add_argument("-y", "--yes", action="store_true")
     s.add_argument("--no-validate", action="store_true")
+    s.add_argument("--pull", action="store_true", help="git pull the backups repo first")
     s.set_defaults(func=cmd_restore)
 
     s = sub.add_parser("endpoints", help="show configured endpoints")

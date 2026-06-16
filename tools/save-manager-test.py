@@ -163,6 +163,37 @@ def main():
                                      or "server" in r.stdout),
               r.stdout + r.stderr)
 
+        # 13. git-backed backups: --push commits into a git repo with a bare remote (no network)
+        gitwork = os.path.join(work, "gitbackups")
+        bare = os.path.join(work, "backups.git")
+        subprocess.run(["git", "init", "--bare", "-q", bare], check=True)
+        subprocess.run(["git", "init", "-q", gitwork], check=True)
+        for kv in (("user.email", "t@e.st"), ("user.name", "Test"), ("commit.gpgsign", "false")):
+            subprocess.run(["git", "-C", gitwork, "config", *kv], check=True)
+        subprocess.run(["git", "-C", gitwork, "remote", "add", "origin", bare], check=True)
+        # seed an initial commit + upstream so pull/push have a branch
+        open(os.path.join(gitwork, "README"), "w").write("backups")
+        subprocess.run(["git", "-C", gitwork, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", gitwork, "commit", "-qm", "init"], check=True)
+        br = subprocess.run(["git", "-C", gitwork, "rev-parse", "--abbrev-ref", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+        subprocess.run(["git", "-C", gitwork, "push", "-q", "-u", "origin", br], check=True)
+        open(local_save, "wb").write(save_blob("F"))
+        r = manager("--dir", gitwork, "backup", local_save, "--label", "mac", "--push")
+        check("git backup --push commits + pushes", r.returncode == 0 and "pushed" in r.stdout, r.stdout + r.stderr)
+        committed = subprocess.run(["git", "-C", gitwork, "log", "--oneline"],
+                                   capture_output=True, text=True).stdout
+        check("snapshot committed to git", "backup(mac)" in committed, committed)
+        check("snapshot file tracked by git",
+              subprocess.run(["git", "-C", gitwork, "ls-files"], capture_output=True, text=True
+                             ).stdout.count("cc.save") >= 2)  # snapshots/.../cc.save + latest/cc.save
+
+        # 14. restore --pull from the git-backed repo, then restore latest to a file
+        dst2 = os.path.join(work, "from-git.save")
+        r = manager("--dir", gitwork, "restore", "latest", dst2, "-y", "--pull")
+        check("restore latest from git-backed repo", r.returncode == 0 and open(dst2, "rb").read() == save_blob("F"),
+              r.stdout + r.stderr)
+
     finally:
         server.terminate()
         try:

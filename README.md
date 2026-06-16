@@ -56,6 +56,7 @@ cc-tailsync/
   docs/
     iOS.md  macOS.md  Windows.md     per-platform setup
     save-manager.md                  the save-manager CLI: endpoints, commands, recipes
+    Tailscale.md                     MagicDNS / tailscale serve / Taildrop / key-expiry setup
 ```
 
 ## Quick start
@@ -125,11 +126,38 @@ Name your machines once so you can say `windows` instead of an IP — copy
                  "mac":     "http://100.100.0.10:8765" } }
 ```
 
-Every overwrite first copies the destination's current save to `~/.cc-tailsync/manager-backups/`,
-and saves are validated as CrossCode JSON before writing — so a forced push is always recoverable.
-Reaching another **desktop** requires its `save-server.py` running (see step 1); reaching **iOS**
-needs the iPhone on USB to a Mac (so iOS↔Windows routes through the Mac). Full guide:
-[`docs/save-manager.md`](docs/save-manager.md).
+## Durable backups (the private cc-tailsync-backups org repo)
+
+`backup` / `list` / `restore` snapshot a save with a `sha`+`meta.json`, in the same layout as the
+private **[cc-tailsync-backups](https://github.com/cc-mods/cc-tailsync-backups)** org repo
+(`snapshots/<stamp>-<source>/cc.save` + `latest/cc.save`). If a checkout of that repo sits next to
+this one (or at `~/.cc-tailsync/cc-tailsync-backups`, or `$CC_BACKUPS_DIR`), the manager uses it
+automatically — so backups are versioned and off-device:
+
+```bash
+save-manager.py backup ios --push          # snapshot the phone's save AND git commit+push to the org repo
+save-manager.py list --pull                 # pull latest, then list every snapshot
+save-manager.py restore latest local --pull # pull, then restore newest snapshot to this desktop
+save-manager.py restore 3f547698 ios        # restore a specific snapshot (by sha) to the phone
+```
+
+`--push` is multi-agent safe (it pulls --rebase before pushing and never force-pushes). Without a
+git checkout it falls back to a plain local folder (`~/.cc-tailsync/backups`); `--dir` overrides.
+
+## Stable names instead of IPs (MagicDNS)
+
+Endpoints take any URL, so prefer **MagicDNS hostnames** over `100.x` Tailscale IPs — they're stable
+and keep IPs out of your configs. With MagicDNS on (admin console → DNS), bare tailnet names resolve:
+
+```json
+{ "endpoints": { "windows": "http://small:8765",
+                 "mac":     "http://milively-mbp-work:8765" } }
+```
+
+Even better, run `tailscale serve --bg localhost:8765` on the save-server host to get an
+auto-TLS **HTTPS** endpoint with a stable name (`https://<host>.<tailnet>.ts.net`), then point the
+config there — no port, encrypted, tailnet-only. See [`docs/save-manager.md`](docs/save-manager.md)
+and [`docs/Tailscale.md`](docs/Tailscale.md).
 
 ## Relationship to cc-ios
 

@@ -53,8 +53,29 @@ save-manager.py endpoints                 # show configured endpoints
 ```
 
 Flags: `-y/--yes` (no prompt), `--dry-run` (sync only), `--no-validate` (skip the CrossCode-save
-check), `--token` (bearer for server endpoints), `--dir` (snapshot dir; default
-`~/.cc-tailsync/backups`).
+check), `--token` (bearer for server endpoints), `--dir` (snapshot dir), `--push` (backup: git
+commit+push), `--pull` (list/restore: git pull first).
+
+## Durable backups via the cc-tailsync-backups org repo
+
+`backup` / `list` / `restore` use the **same layout** as the private
+[**cc-tailsync-backups**](https://github.com/cc-mods/cc-tailsync-backups) org repo
+(`snapshots/<UTC-stamp>-<label>/cc.save` + `meta.json`, and `latest/cc.save`). The snapshot dir
+**auto-resolves** to a checkout of that repo if one is found — a sibling of this repo, or
+`~/.cc-tailsync/cc-tailsync-backups`, or `$CC_BACKUPS_DIR` — otherwise it falls back to
+`~/.cc-tailsync/backups`. With a git checkout you get versioned, off-device history:
+
+```bash
+save-manager.py backup ios --push            # snapshot the phone, then git commit + push to the org
+save-manager.py backup local --label mac --push
+save-manager.py list --pull                   # pull, then list all snapshots
+save-manager.py restore latest local --pull   # pull, then restore newest to this desktop
+save-manager.py restore 3f547698 ios           # restore a specific snapshot (by sha prefix) to the phone
+```
+
+`--push` pulls `--rebase` before pushing and **never force-pushes** (safe alongside other agents).
+That backups repo is **private** and deliberately commits `*.save` (the one place saves belong in
+git); every other cc-mods repo git-ignores saves.
 
 ## Recipes (the "any platform to any other" matrix)
 
