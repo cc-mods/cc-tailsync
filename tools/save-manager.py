@@ -615,8 +615,8 @@ def cmd_endpoints(args, config):
     print("Built-in: local, ios, <http://host:port>, <file path>")
     if not eps:
         print("No cc-endpoints.json found. Create one to name your remotes, e.g.:")
-        print('  { "endpoints": { "windows": "http://100.82.159.98:8765",')
-        print('                   "mac":     "http://100.78.108.87:8765" } }')
+        print('  { "endpoints": { "windows": "http://100.100.0.21:8765",')
+        print('                   "mac":     "http://100.100.0.10:8765" } }')
         return 0
     print("Configured (cc-endpoints.json):")
     for k, v in eps.items():
