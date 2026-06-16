@@ -52,6 +52,18 @@ def _git(d, *args):
                           capture_output=True, text=True)
 
 
+# Inline config so backups commit cleanly regardless of the host's global git/gpg setup. A common
+# trap: a global `commit.gpgsign=true` with no gpg installed (e.g. under launchd) makes every commit
+# fail with "cannot run gpg". We also pin an identity so a service account with no user.name/email
+# can still commit. These are per-invocation (-c), never written to the repo config.
+_COMMIT_CFG = [
+    "-c", "commit.gpgsign=false",
+    "-c", "tag.gpgsign=false",
+    "-c", "user.name=Yoyokrazy",
+    "-c", "user.email=12552271+Yoyokrazy@users.noreply.github.com",
+]
+
+
 def git_pull(d):
     """Best-effort fast-forward pull (no-op if not a git repo)."""
     if is_git_repo(d):
@@ -62,12 +74,14 @@ def git_commit_push(d, message, push=True):
     """Commit staged changes; optionally pull --rebase then push. Returns a short status string.
 
     Never force-pushes (multi-agent safe). Tolerates 'nothing to commit' and a missing remote.
+    Commits with gpg signing disabled + a pinned identity so it works under launchd / service
+    accounts where the global git config may enable signing or omit a user identity.
     """
     if not is_git_repo(d):
         return "saved locally (not a git repo)"
     with _GIT_LOCK:
         _git(d, "add", "-A")
-        r = _git(d, "commit", "-m", message)
+        r = _git(d, *_COMMIT_CFG, "commit", "-m", message)
         if r.returncode != 0:
             if "nothing to commit" in (r.stdout + r.stderr):
                 return "no change — nothing to commit"

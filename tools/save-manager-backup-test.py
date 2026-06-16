@@ -83,8 +83,14 @@ def main():
 
     # --- Part A: cc_backup unit behavior ---
     repoA = make_git_backups(work)
+    # Force a hostile global-style config IN the repo: gpgsign on + no user identity. The helper must
+    # still commit (it passes -c commit.gpgsign=false + a pinned identity). Regression for the
+    # "cannot run gpg" failure seen under launchd.
+    git(repoA, "config", "commit.gpgsign", "true")
+    git(repoA, "config", "--unset", "user.name")
+    git(repoA, "config", "--unset", "user.email")
     r = cc_backup.backup(repoA, save_blob("A"), "mac", source="unit", push=True)
-    check("cc_backup: first backup commits+pushes", not r["skipped"] and "pushed" in r["git"], r)
+    check("cc_backup: first backup commits+pushes (gpgsign forced on)", not r["skipped"] and "pushed" in r["git"], r)
     check("cc_backup: latest/cc.save written", open(os.path.join(repoA, "latest", "cc.save"), "rb").read() == save_blob("A"))
     r = cc_backup.backup(repoA, save_blob("A"), "mac", push=True, dedupe=True)
     check("cc_backup: dedupe skips identical save", r["skipped"] and "skipped" in r["git"], r)
