@@ -1,6 +1,8 @@
 # ---- private sync config (may hold a Tailscale IP + bearer token; NEVER commit) ----
 cc-sync.json
 **/cc-sync.json
+cc-endpoints.json
+**/cc-endpoints.json
 
 # ---- CrossCode save files / game data (never commit personal saves or game assets) ----
 *.save

@@ -46,11 +46,16 @@ cc-tailsync/
     macos/save-server.sh             run it persistently on macOS (launchd)
     windows/save-server.ps1          run it persistently on Windows (Scheduled Task)
   tools/
+    save-manager.py                  cross-platform CLI: FORCE/sync a save between any of your
+                                     platforms (local file / USB iPhone / a save-server URL)
+    save-manager-test.py             stdlib integration tests for save-manager (no device needed)
     setup-sync.sh                    detect this Mac's Tailscale IP + push cc-sync.json to the phone
     save-sync.sh                     one-shot USB sync (no network), newest-wins
     integrate-ios.sh                 wire CCTailsync into a cc-ios checkout (one command)
+  cc-endpoints.example.json          template for naming your machines (copy -> cc-endpoints.json)
   docs/
     iOS.md  macOS.md  Windows.md     per-platform setup
+    save-manager.md                  the save-manager CLI: endpoints, commands, recipes
 ```
 
 ## Quick start
@@ -82,6 +87,49 @@ Rebuild cc-ios. It now pushes on every save and pulls a newer PC save at launch.
 
 > **No Tailscale? No network?** `tools/save-sync.sh` does a one-shot **USB** sync between a
 > connected iPhone and the desktop save via `devicectl` — newest-wins, both directions.
+
+## Force a save between platforms (save-manager)
+
+The push-on-save / pull-at-launch client above keeps things in sync automatically. When you instead
+want to **deliberately force one device's save onto another** — "make my Windows save match what I
+just played on the phone" — use the **`tools/save-manager.py`** CLI. It's pure Python 3 (stdlib
+only) and speaks the same protocol as the save-server, so it runs on **macOS and Windows** alike.
+
+Each platform is an **endpoint**:
+
+| token | what it is | where it works |
+|---|---|---|
+| `local` | this machine's desktop CrossCode save (auto-detected per OS) | anywhere |
+| `ios` | a USB-connected iPhone running cc-ios (`xcrun devicectl`) | macOS only |
+| `http://host:port` | another desktop running `save-server.py`, over your tailnet | anywhere |
+| `<name>` | a friendly alias from `cc-endpoints.json` | anywhere |
+
+```bash
+# see every device's save side-by-side and which is newest
+tools/save-manager.py status local ios windows
+
+# FORCE (overwrite) — "any platform to any other"
+tools/save-manager.py push ios local       # phone   -> this Mac
+tools/save-manager.py push local windows    # this Mac -> the Windows desktop (its save-server)
+tools/save-manager.py push windows ios       # Windows  -> phone   (run on the Mac; routes via USB)
+
+# or let it pick the newer side
+tools/save-manager.py sync local windows
+```
+
+Name your machines once so you can say `windows` instead of an IP — copy
+[`cc-endpoints.example.json`](cc-endpoints.example.json) to `cc-endpoints.json` (git-ignored):
+
+```json
+{ "endpoints": { "windows": "http://100.100.0.21:8765",
+                 "mac":     "http://100.100.0.10:8765" } }
+```
+
+Every overwrite first copies the destination's current save to `~/.cc-tailsync/manager-backups/`,
+and saves are validated as CrossCode JSON before writing — so a forced push is always recoverable.
+Reaching another **desktop** requires its `save-server.py` running (see step 1); reaching **iOS**
+needs the iPhone on USB to a Mac (so iOS↔Windows routes through the Mac). Full guide:
+[`docs/save-manager.md`](docs/save-manager.md).
 
 ## Relationship to cc-ios
 
