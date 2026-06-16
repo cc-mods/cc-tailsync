@@ -43,12 +43,14 @@ cc-tailsync/
     TailscaleSyncClient.swift        the iOS sync client (consumed by cc-ios's SaveSyncProvider seam)
   servers/
     save-server.py                   the HTTP save hub (Windows / macOS / Linux save paths)
+    cc_backup.py                     shared snapshot+git helper (used by the hub AND save-manager)
     macos/save-server.sh             run it persistently on macOS (launchd)
     windows/save-server.ps1          run it persistently on Windows (Scheduled Task)
   tools/
     save-manager.py                  cross-platform CLI: FORCE/sync a save between any of your
-                                     platforms (local file / USB iPhone / a save-server URL)
+                                     platforms (local file / USB iPhone / save-server / ssh host)
     save-manager-test.py             stdlib integration tests for save-manager (no device needed)
+    save-manager-backup-test.py      stdlib tests for cc_backup + the hub's auto-backup
     setup-sync.sh                    detect this Mac's Tailscale IP + push cc-sync.json to the phone
     save-sync.sh                     one-shot USB sync (no network), newest-wins
     integrate-ios.sh                 wire CCTailsync into a cc-ios checkout (one command)
@@ -145,6 +147,30 @@ save-manager.py restore 3f547698 ios        # restore a specific snapshot (by sh
 
 `--push` is multi-agent safe (it pulls --rebase before pushing and never force-pushes). Without a
 git checkout it falls back to a plain local folder (`~/.cc-tailsync/backups`); `--dir` overrides.
+
+### Auto-back up every save to GitHub (including the phone's)
+
+The desktop commands above are manual. To get **every** save into the backups repo automatically —
+crucially **including the phone's**, which can't run git — point the **save-server** at a checkout of
+the backups repo. Every save it receives (the phone pushes one each time you finish playing) is then
+snapshotted, committed, and pushed:
+
+```bash
+# run the hub with auto-backup (commit + push each received save to the org repo):
+servers/save-server.py --backup-repo /path/to/cc-tailsync-backups --backup-push
+#   --backup-label NAME   label for the snapshots (default: hub)
+#   (omit --backup-push to commit locally and push on your own schedule)
+```
+
+Now the flow is: **phone finishes → pushes its save to the hub → hub commits+pushes it to GitHub.**
+No phone-side code, no git on the phone. Desktops can still `save-manager backup --push` directly.
+It's the **same `cc_backup` helper** under both, so the snapshot layout is identical. Identical saves
+are de-duplicated (no commit spam). The hub host just needs the backups repo cloned with push creds.
+
+> The persistent-service wrappers accept the same flags, e.g.
+> `CC_BACKUP_REPO=/path/to/cc-tailsync-backups servers/macos/save-server.sh install` (or set
+> `--backup-repo` in the task). The backups repo is **private** and is the one place saves belong in
+> git — every other cc-mods repo git-ignores them.
 
 ## Stable names instead of IPs (MagicDNS)
 

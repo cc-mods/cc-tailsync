@@ -27,11 +27,17 @@ log_err="$log_dir/save-server.err.log"
 
 port=8765
 save_path=""
+backup_repo="${CC_BACKUP_REPO:-}"
+backup_label=""
+backup_push=0
 cmd="${1:-}"; shift || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) port="$2"; shift 2;;
     --save) save_path="$2"; shift 2;;
+    --backup-repo) backup_repo="$2"; shift 2;;
+    --backup-label) backup_label="$2"; shift 2;;
+    --backup-push) backup_push=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -50,8 +56,10 @@ install() {
   # a copy into ~/.cc-tailsync (a dotfolder, not TCC-protected) and run that.
   local installed_py="$log_dir/save-server.py"
   cp "$server_py" "$installed_py"
+  # The server imports cc_backup.py from its own dir (optional auto-backup); copy it too.
+  [[ -f "$repo_root/servers/cc_backup.py" ]] && cp "$repo_root/servers/cc_backup.py" "$log_dir/cc_backup.py"
 
-  # Build the ProgramArguments + optional --save.
+  # Build the ProgramArguments + optional --save / auto-backup flags.
   local args="    <string>${installed_py}</string>
     <string>--port</string>
     <string>${port}</string>"
@@ -59,6 +67,16 @@ install() {
     args="${args}
     <string>--save</string>
     <string>${save_path}</string>"
+  fi
+  if [[ -n "$backup_repo" ]]; then
+    args="${args}
+    <string>--backup-repo</string>
+    <string>${backup_repo}</string>"
+    [[ -n "$backup_label" ]] && args="${args}
+    <string>--backup-label</string>
+    <string>${backup_label}</string>"
+    [[ "$backup_push" -eq 1 ]] && args="${args}
+    <string>--backup-push</string>"
   fi
 
   # Optional token via EnvironmentVariables.

@@ -51,6 +51,11 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
+# Shared snapshot + git-backup helper (servers/cc_backup.py), used by both this CLI and the
+# save-server so backups land in the cc-tailsync-backups repo in one consistent layout.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "servers"))
+import cc_backup
+
 
 # --------------------------------------------------------------------------- save path / model
 
@@ -90,45 +95,14 @@ def default_backups_dir():
 
 
 # --------------------------------------------------------------------------- git (backups repo)
+# Delegate to the shared helper so save-manager and save-server stay byte-for-byte consistent.
 
 def is_git_repo(d):
-    return os.path.isdir(os.path.join(os.path.expanduser(d), ".git"))
-
-
-def _git(d, *args, check=True):
-    r = subprocess.run(["git", "-C", os.path.expanduser(d), *args],
-                       capture_output=True, text=True)
-    if check and r.returncode != 0:
-        raise EndpointError(f"git {' '.join(args)} failed: {(r.stderr or r.stdout).strip()[:200]}")
-    return r
+    return cc_backup.is_git_repo(d)
 
 
 def git_pull(d):
-    """Best-effort fast-forward pull (no-op if not a git repo or no remote)."""
-    if is_git_repo(d):
-        _git(d, "pull", "--ff-only", "--quiet", check=False)
-
-
-def git_commit_push(d, message):
-    """Commit new snapshots and push. Coordinates with other agents (rebase) and never force-pushes.
-
-    Returns a short status string for printing. Tolerates 'nothing to commit' and a missing remote.
-    """
-    if not is_git_repo(d):
-        return "not a git repo — snapshot saved locally only (point --dir at a cc-tailsync-backups clone to version it)"
-    _git(d, "add", "-A")
-    r = _git(d, "commit", "-m", message, check=False)
-    if r.returncode != 0:
-        if "nothing to commit" in (r.stdout + r.stderr):
-            return "nothing new to commit"
-        return f"commit skipped ({(r.stderr or r.stdout).strip()[:120]})"
-    # Pull-rebase before push (multi-agent safe), then push if a remote exists.
-    has_remote = _git(d, "remote", check=False).stdout.strip() != ""
-    if has_remote:
-        _git(d, "pull", "--rebase", "--quiet", check=False)
-        p = _git(d, "push", "--quiet", check=False)
-        return "committed + pushed" if p.returncode == 0 else "committed locally (push failed — check the remote/auth)"
-    return "committed locally (no remote configured)"
+    cc_backup.git_pull(d)
 
 
 
@@ -723,28 +697,13 @@ def cmd_backup(args, config):
     ep = resolve(args.endpoint, config, args.token)
     blob = ep.read()
     base = os.path.expanduser(args.dir)
-    if args.push:
-        git_pull(base)  # start from latest so our commit is additive
     label = args.label or ep.kind
-    snap = os.path.join(base, "snapshots", f"{stamp_utc()}-{label}")
-    os.makedirs(snap, exist_ok=True)
-    with open(os.path.join(snap, "cc.save"), "wb") as f:
-        f.write(blob.data)
-    meta = {"source": label, "endpoint": ep.describe(), "file": "cc.save",
-            "size_bytes": blob.size, "sha256": blob.sha,
-            "save_mtime_utc": human_mtime(blob.mtime),
-            "captured_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-    json.dump(meta, open(os.path.join(snap, "meta.json"), "w"), indent=2)
-    latest = os.path.join(base, "latest")
-    os.makedirs(latest, exist_ok=True)
-    shutil.copy2(os.path.join(snap, "cc.save"), os.path.join(latest, "cc.save"))
-    json.dump(meta, open(os.path.join(latest, "meta.json"), "w"), indent=2)
-    print(f"backed up {ep.describe()} -> {snap}  ({blob.size} b, sha {blob.sha[:12]})")
+    # Explicit CLI backup always snapshots (dedupe=False); the hub uses dedupe to avoid spam.
+    r = cc_backup.backup(base, blob.data, label, mtime=blob.mtime, source=ep.describe(),
+                         push=args.push, dedupe=False)
+    print(f"backed up {ep.describe()} -> {r['snapshot']}  ({blob.size} b, sha {blob.sha[:12]})")
     if args.push:
-        status = git_commit_push(base, f"backup({label}): cc.save {os.path.basename(snap)} "
-                                       f"({blob.size}b, sha {blob.sha[:12]})\n\n"
-                                       f"Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>")
-        print(f"  git: {status}")
+        print(f"  git: {r['git']}")
     elif is_git_repo(base):
         print("  (this is a git-backed backups repo — add --push to commit + push the snapshot)")
     return 0

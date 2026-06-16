@@ -42,7 +42,10 @@ param(
     [string]$Command = 'status',
     [int]$Port = 8765,
     [string]$Save = '',
-    [string]$Token = $env:CC_SYNC_TOKEN
+    [string]$Token = $env:CC_SYNC_TOKEN,
+    [string]$BackupRepo = $env:CC_BACKUP_REPO,
+    [string]$BackupLabel = '',
+    [switch]$BackupPush
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,14 +67,23 @@ function Invoke-Install {
     if (-not (Test-Path $serverPy)) { throw "server not found: $serverPy" }
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     Copy-Item -Force $serverPy $installedPy
+    # The server imports cc_backup.py from its own dir (optional auto-backup); copy it too.
+    $ccBackup = Join-Path $repoRoot 'servers\cc_backup.py'
+    if (Test-Path $ccBackup) { Copy-Item -Force $ccBackup (Join-Path $installDir 'cc_backup.py') }
 
     $pyExe = Resolve-Python
 
     # Build the inner PowerShell command the task will run. The token (if any) is set as an env var
-    # for the server process; the save path is passed through when provided.
+    # for the server process; the save path + auto-backup flags are passed through when provided.
     $envPrefix = if ($Token) { "`$env:CC_SYNC_TOKEN='$Token'; " } else { "" }
     $saveArg   = if ($Save)  { " --save '$Save'" } else { "" }
-    $inner     = "$envPrefix& '$pyExe' '$installedPy' --port $Port$saveArg"
+    $backupArg = ""
+    if ($BackupRepo) {
+        $backupArg = " --backup-repo '$BackupRepo'"
+        if ($BackupLabel) { $backupArg += " --backup-label '$BackupLabel'" }
+        if ($BackupPush)  { $backupArg += " --backup-push" }
+    }
+    $inner     = "$envPrefix& '$pyExe' '$installedPy' --port $Port$saveArg$backupArg"
     $argument  = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$inner`""
 
     $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
@@ -123,6 +135,11 @@ function Invoke-Run {
     if ($Token) { $env:CC_SYNC_TOKEN = $Token }
     $args = @($serverPy, '--port', $Port)
     if ($Save) { $args += @('--save', $Save) }
+    if ($BackupRepo) {
+        $args += @('--backup-repo', $BackupRepo)
+        if ($BackupLabel) { $args += @('--backup-label', $BackupLabel) }
+        if ($BackupPush)  { $args += '--backup-push' }
+    }
     & $pyExe @args
 }
 
