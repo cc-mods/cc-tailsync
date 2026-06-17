@@ -29,13 +29,18 @@
 #     (`run`). The bridge never auto-clobbers; a real conflict always waits for you.
 set -euo pipefail
 
-label="com.cc-tailsync.github-bridge"
+# A clean, identifiable name for the background process. macOS's background-items notification + the
+# Activity Monitor entry are named after the EXECUTED program — so we run a descriptively-named runner
+# (`cc-save-sync`) directly via its shebang, NOT `/bin/bash <script>` (which would show up as a generic
+# "bash was running in the background"). The launchd label is suite-branded for the same reason.
+label="com.cc-mods.cc-save-sync"
+old_labels=("com.cc-tailsync.github-bridge")   # migrate/clean up any earlier installs
 plist="$HOME/Library/LaunchAgents/${label}.plist"
 install_dir="$HOME/.cc-tailsync"
 installed_py="$install_dir/github-steam-bridge.py"
-installed_sh="$install_dir/github-bridge-run.sh"
-log_out="$install_dir/github-bridge.out.log"
-log_err="$install_dir/github-bridge.err.log"
+runner="$install_dir/cc-save-sync"             # the named executable launchd runs (basename shows up)
+log_out="$install_dir/cc-save-sync.out.log"
+log_err="$install_dir/cc-save-sync.err.log"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bridge_py="$script_dir/../github-steam-bridge.py"
@@ -57,10 +62,12 @@ done
 
 # A small wrapper the agent actually runs: always push if the save moved; pull only when the pull
 # interval has elapsed AND CrossCode isn't running (so we never fight a live game / Steam sync).
+# Named `cc-save-sync` (not *.sh) so macOS shows that as the background process, not "bash".
 write_runner() {
-  cat > "$installed_sh" <<RUNNER
-#!/usr/bin/env bash
+  cat > "$runner" <<RUNNER
+#!/bin/bash
 set -euo pipefail
+# cc-save-sync — CrossCode save sync (cc-mods). Mirrors this Mac's Steam cc.save <-> the GitHub hub.
 PY="$python_bin"
 BRIDGE="$installed_py"
 SAVE="$steam_save"
@@ -81,7 +88,16 @@ if [[ "\$PULL_INTERVAL" -gt 0 ]] && ! pgrep -x "CrossCode" >/dev/null 2>&1 && ! 
   fi
 fi
 RUNNER
-  chmod +x "$installed_sh"
+  chmod +x "$runner"
+}
+
+# Remove any older-labelled installs (renamed for a cleaner background-process name).
+clean_old() {
+  for old in "${old_labels[@]}"; do
+    local old_plist="$HOME/Library/LaunchAgents/${old}.plist"
+    [[ -f "$old_plist" ]] && { launchctl unload "$old_plist" 2>/dev/null || true; rm -f "$old_plist"; }
+  done
+  rm -f "$install_dir/github-bridge-run.sh"   # the old generically-named runner
 }
 
 install() {
@@ -89,6 +105,7 @@ install() {
   [[ -f "$install_dir/cc-github.json" ]] || {
     echo "error: $install_dir/cc-github.json missing (needs { repo, path, token })." >&2; exit 1; }
   mkdir -p "$install_dir"
+  clean_old
   cp "$bridge_py" "$installed_py"
   write_runner
 
@@ -101,8 +118,7 @@ install() {
   <string>${label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
-    <string>${installed_sh}</string>
+    <string>${runner}</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -122,9 +138,9 @@ PLIST
 
   launchctl unload "$plist" 2>/dev/null || true
   launchctl load "$plist"
-  echo "Installed and loaded $label."
+  echo "Installed and loaded $label (process shows as 'cc-save-sync')."
   echo "  bridge: $installed_py  (copied from $bridge_py)"
-  echo "  runner: $installed_sh"
+  echo "  runner: $runner"
   echo "  plist:  $plist"
   echo "  push:   on every change to $steam_save"
   echo "  pull:   every ${pull_interval}s, only when CrossCode is closed (0 = disabled)"
@@ -133,7 +149,8 @@ PLIST
 
 uninstall() {
   launchctl unload "$plist" 2>/dev/null || true
-  rm -f "$plist" "$installed_sh"
+  clean_old
+  rm -f "$plist" "$runner"
   echo "Uninstalled $label. (left $installed_py + config in $install_dir)"
 }
 
