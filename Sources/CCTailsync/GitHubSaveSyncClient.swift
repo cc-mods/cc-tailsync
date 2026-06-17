@@ -10,18 +10,21 @@ import CryptoKit
 /// **Conflict model — content identity, never wall-clock time.** GitHub's Contents API returns a git
 /// **blob SHA** for the file (SHA-1 of `"blob <len>\0" + bytes`, exactly what `git hash-object`
 /// computes). We compute the same locally, so "did anything change?" is a pure content comparison.
-/// The device persists the blob SHA it last synced (`lastSyncedSha`); on a check we compare {local
-/// content sha, remote sha, lastSynced} to decide:
-///   - identical content                       → `.inSync`
-///   - local changed, remote unchanged          → `.pushLocal`  (local strictly ahead — upload)
-///   - remote moved (and differs from local)    → `.offerLoadRemote` (prompt "newer save — load? Y/N")
-/// Writes use `PUT` with the prior blob SHA as an **optimistic lock** (409 on a concurrent change),
-/// so no last-writer-wins races. The host (cc-ios) owns the actual Y/N prompt + applying a pulled
-/// save; this type is logic + transport only (no UI), matching the suite's separation.
+/// The device persists the blob SHA it last synced (`lastSyncedSha`); see `resolveCheck` for the
+/// decision table.
+///
+/// **Two safe entry points for cc-ios:**
+///  - `pullIfNewerBlocking(timeout:)` at launch — phone-authoritative & non-interactive: seeds the
+///    local save only when there is NO local save (fresh install / restore), pushes when the local is
+///    strictly ahead, and otherwise does nothing. It **never** overwrites an existing local save, and
+///    it never prompts.
+///  - `checkForConsentPull(completion:)` after boot — if a local save exists AND the hub holds a
+///    different, advanced save, it hands the remote bytes back so the host can show a
+///    **"newer save detected — load? Y/N"** prompt. Applying is the host's call (`applyPulledConsent`).
 ///
 /// **Fail-safe & dormant by default.** With no config file (no repo/token) every call is a silent
-/// no-op — so shipping this code costs nothing until you opt in by dropping a `cc-github.json` with a
-/// fine-grained PAT (one repo, Contents read/write) into the app's Documents directory.
+/// no-op — so shipping this costs nothing until a `Documents/cc-github.json`
+/// (`{ "repo", "path", "token" }`, a fine-grained PAT with Contents:R/W on the one repo) is present.
 public final class GitHubSaveSyncClient {
 
     public struct Config {
@@ -35,10 +38,10 @@ public final class GitHubSaveSyncClient {
     private let stateURL: URL
     private let session: URLSession
 
-    /// - Parameters:
-    ///   - saveFileURL: the local canonical save (cc-ios passes `Documents/cc.save`).
-    ///   - configURL: the sync config JSON. Defaults to `Documents/cc-github.json`.
-    ///   - stateURL: where the last-synced blob SHA is persisted. Defaults to `Documents/cc-github-state.json`.
+    /// The remote sha of the offer currently awaiting the user's decision (set by
+    /// `checkForConsentPull`, consumed by `applyPulledConsent`).
+    private var pendingRemoteSha: String?
+
     public init(saveFileURL: URL, configURL: URL? = nil, stateURL: URL? = nil) {
         self.saveFileURL = saveFileURL
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -88,8 +91,9 @@ public final class GitHubSaveSyncClient {
         return Insecure.SHA1.hash(data: input).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// What a home-screen check should do, given local content SHA, the last-synced SHA, and the
-    /// remote SHA (any of which may be absent). Pure — the decision core of the whole client.
+    /// What a check should conclude, given local content SHA, the last-synced SHA, and the remote SHA
+    /// (any of which may be absent). Pure — the decision core, shared by the launch and consent paths
+    /// and mirrored by the Python PC bridge.
     public enum SyncAction: Equatable {
         case inSync               // remote content == local content → nothing to do
         case pushLocal            // local strictly ahead (remote unchanged since last sync) → upload
@@ -112,103 +116,109 @@ public final class GitHubSaveSyncClient {
         }
     }
 
-    // MARK: - Remote check (GET) — decides, never auto-overwrites the local save
+    // MARK: - Launch sync (blocking, non-interactive, phone-authoritative)
 
-    /// The result of a home-screen check. `.offerLoadRemote` carries the downloaded remote bytes +
-    /// its sha so the host can apply it iff the user says yes.
-    public enum CheckResult {
-        case inSync
-        case pushed                                   // local was ahead and has been uploaded
-        case seededHub                                // hub was empty; local uploaded as the baseline
-        case offerLoadRemote(content: Data, remoteSha: String)
-        case notConfigured
-        case failed
-    }
+    /// Blocking launch sync. Seeds the local save ONLY when there is no local save (fresh install /
+    /// restore); pushes when the local save is strictly ahead or the hub is empty; otherwise does
+    /// nothing. NEVER overwrites an existing local save and NEVER prompts. Returns whether the local
+    /// file was written (seeded) — the caller should then re-read it for injection.
+    public func pullIfNewerBlocking(timeout: TimeInterval) -> Bool {
+        guard isConfigured else { return false }
+        let sem = DispatchSemaphore(value: 0)
+        var seeded = false
+        fetchRemote { [weak self] remoteSha, remoteContent in
+            defer { sem.signal() }
+            guard let self = self, let config = self.loadConfig() else { return }
+            let localData = try? Data(contentsOf: self.saveFileURL)
+            let localSha = localData.map { Self.gitBlobSha($0) }
 
-    /// Read the hub's current file metadata + content, compare by content SHA, and either upload a
-    /// strictly-newer local save, report in-sync, or hand back the remote bytes for the host to offer
-    /// via a "newer save detected — load? Y/N" prompt. NEVER writes the local save file itself.
-    public func check(completion: @escaping (CheckResult) -> Void) {
-        guard let config = loadConfig() else { completion(.notConfigured); return }
-        let localData = try? Data(contentsOf: saveFileURL)
-        let localSha = localData.map { Self.gitBlobSha($0) }
-
-        var request = contentsRequest(config)
-        session.dataTask(with: request) { [weak self] data, response, _ in
-            guard let self = self else { completion(.failed); return }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-
-            // 404 → file not in the hub yet.
-            var remoteSha: String?
-            var remoteContent: Data?
-            if status == 200, let data = data,
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                remoteSha = obj["sha"] as? String
-                if let b64 = obj["content"] as? String {
-                    let cleaned = b64.replacingOccurrences(of: "\n", with: "")
-                    remoteContent = Data(base64Encoded: cleaned)
+            // No local save → safe to adopt the hub's (nothing to lose). This is the only path that
+            // writes the local file at launch, and only when there's no on-device progress to protect.
+            if localSha == nil {
+                if let content = remoteContent, let sha = remoteSha {
+                    do {
+                        try content.write(to: self.saveFileURL, options: .atomic)
+                        self.saveLastSyncedSha(sha)
+                        seeded = true
+                    } catch {
+                        NSLog("[cc-github] seed write failed: %@", error.localizedDescription)
+                    }
                 }
-            } else if status != 404 {
-                completion(.failed); return
+                return
             }
 
             switch Self.resolveCheck(localBlobSha: localSha,
                                      lastSyncedSha: self.loadLastSyncedSha(),
                                      remoteBlobSha: remoteSha) {
             case .inSync:
-                if let s = remoteSha { self.saveLastSyncedSha(s) }
-                completion(.inSync)
-            case .pushLocal:
-                guard let value = localData else { completion(.failed); return }
-                self.put(config: config, content: value, priorSha: remoteSha) { ok in
-                    completion(ok ? .pushed : .failed)
-                }
-            case .firstPush:
-                guard let value = localData else { completion(.failed); return }
-                self.put(config: config, content: value, priorSha: nil) { ok in
-                    completion(ok ? .seededHub : .failed)
-                }
+                if let sha = remoteSha { self.saveLastSyncedSha(sha) }
+            case .pushLocal, .firstPush:
+                if let value = localData { self.putBlocking(config: config, content: value, priorSha: remoteSha) }
             case .offerLoadRemote:
-                if let content = remoteContent, let s = remoteSha {
-                    completion(.offerLoadRemote(content: content, remoteSha: s))
-                } else { completion(.failed) }
+                break   // a real divergence — left for the consent prompt, never auto-applied
             case .nothing:
-                completion(.inSync)
+                break
             }
-        }.resume()
+        }
+        _ = sem.wait(timeout: .now() + timeout)
+        return seeded
     }
 
-    /// Adopt a remote save the user accepted from `offerLoadRemote`: write it to the local file and
-    /// record its sha as the new sync point. (The host then reloads the game from the file.)
-    public func applyPulled(content: Data, remoteSha: String) -> Bool {
+    // MARK: - Consent pull (interactive; host shows the Y/N prompt)
+
+    /// Non-destructive check for the home-screen prompt. Calls back with the hub's bytes IFF a local
+    /// save exists AND the hub holds a different, advanced save (the `.offerLoadRemote` case); else nil.
+    /// Never writes the local save — the host decides via `applyPulledConsent` after the user accepts.
+    public func checkForConsentPull(completion: @escaping (Data?) -> Void) {
+        guard isConfigured else { completion(nil); return }
+        fetchRemote { [weak self] remoteSha, remoteContent in
+            guard let self = self else { completion(nil); return }
+            let localData = try? Data(contentsOf: self.saveFileURL)
+            let localSha = localData.map { Self.gitBlobSha($0) }
+            guard localSha != nil else { completion(nil); return } // fresh device → launch path seeds
+
+            switch Self.resolveCheck(localBlobSha: localSha,
+                                     lastSyncedSha: self.loadLastSyncedSha(),
+                                     remoteBlobSha: remoteSha) {
+            case .offerLoadRemote:
+                if let content = remoteContent, let sha = remoteSha {
+                    self.pendingRemoteSha = sha
+                    completion(content)
+                } else { completion(nil) }
+            default:
+                completion(nil)
+            }
+        }
+    }
+
+    /// Apply bytes the user accepted from a consent prompt: write them to the local save file and
+    /// record the sync point. Returns success. (The host then reloads the game from the new save.)
+    public func applyPulledConsent(_ data: Data) -> Bool {
         do {
-            try content.write(to: saveFileURL, options: .atomic)
-            saveLastSyncedSha(remoteSha)
+            try data.write(to: saveFileURL, options: .atomic)
+            saveLastSyncedSha(pendingRemoteSha ?? Self.gitBlobSha(data))
+            pendingRemoteSha = nil
             return true
         } catch {
-            NSLog("[cc-github] applyPulled write failed: %@", error.localizedDescription)
+            NSLog("[cc-github] applyPulledConsent write failed: %@", error.localizedDescription)
             return false
         }
     }
 
-    /// Upload the given save bytes to the hub (used after an in-game save). Reads the current remote
-    /// sha first to satisfy the optimistic-lock precondition; on a 409 the next home-screen check will
-    /// surface the divergence as an offer-to-load.
+    // MARK: - Push (on in-game save)
+
+    /// Upload the given save bytes to the hub. Reads the current remote sha first for the optimistic
+    /// lock; on a 409 the next consent check surfaces the divergence as an offer-to-load.
     public func push(_ value: String) {
         guard let config = loadConfig() else { return }
         let data = Data(value.utf8)
-        var request = contentsRequest(config)
-        session.dataTask(with: request) { [weak self] respData, response, _ in
+        fetchRemote { [weak self] remoteSha, _ in
             guard let self = self else { return }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            var priorSha: String?
-            if status == 200, let respData = respData,
-               let obj = try? JSONSerialization.jsonObject(with: respData) as? [String: Any] {
-                priorSha = obj["sha"] as? String
-                if priorSha == Self.gitBlobSha(data) { return } // already current
+            if let remoteSha = remoteSha, remoteSha == Self.gitBlobSha(data) {
+                self.saveLastSyncedSha(remoteSha); return            // already current
             }
-            self.put(config: config, content: data, priorSha: priorSha) { _ in }
-        }.resume()
+            self.put(config: config, content: data, priorSha: remoteSha) { _ in }
+        }
     }
 
     // MARK: - HTTP plumbing
@@ -223,6 +233,24 @@ public final class GitHubSaveSyncClient {
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         return request
+    }
+
+    /// GET the file; call back `(remoteBlobSha?, remoteContent?)` — both nil on a 404 or error.
+    private func fetchRemote(completion: @escaping (String?, Data?) -> Void) {
+        guard let config = loadConfig() else { completion(nil, nil); return }
+        session.dataTask(with: contentsRequest(config)) { data, response, _ in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200, let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                completion(nil, nil); return
+            }
+            let sha = obj["sha"] as? String
+            var content: Data?
+            if let b64 = obj["content"] as? String {
+                content = Data(base64Encoded: b64.replacingOccurrences(of: "\n", with: ""))
+            }
+            completion(sha, content)
+        }.resume()
     }
 
     private func put(config: Config, content: Data, priorSha: String?,
@@ -248,10 +276,15 @@ public final class GitHubSaveSyncClient {
                 self?.saveLastSyncedSha(newSha)
                 completion(true)
             } else {
-                // 409 = optimistic-lock conflict (remote moved). The next check() surfaces it as an
-                // offer-to-load; we don't blindly overwrite.
-                completion(false)
+                completion(false) // 409 = optimistic-lock conflict; surfaced later via a consent check
             }
         }.resume()
+    }
+
+    /// Blocking PUT used by the launch path (already inside a semaphore-bounded callback).
+    private func putBlocking(config: Config, content: Data, priorSha: String?) {
+        let sem = DispatchSemaphore(value: 0)
+        put(config: config, content: content, priorSha: priorSha) { _ in sem.signal() }
+        _ = sem.wait(timeout: .now() + 6)
     }
 }
