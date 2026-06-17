@@ -3,15 +3,15 @@
 Part of the **[cc-mods](https://github.com/cc-mods)** CrossCode suite (wireless save sync).
 
 📓 **Read the suite agent docs first:**
-**[`cc-mods/cc-agentdocs`](https://github.com/cc-mods/cc-agentdocs)** (private; org members only) is the
+**[`cc-mods/cc-agent-tools`](https://github.com/cc-mods/cc-agent-tools)** (private; org members only) is the
 source of truth for hard-won findings — start at its
-[`AGENTS.md`](https://github.com/cc-mods/cc-agentdocs/blob/main/AGENTS.md). Most relevant here:
-- [`cc-tailsync.md`](https://github.com/cc-mods/cc-agentdocs/blob/main/cc-tailsync.md) — architecture,
+[`AGENTS.md`](https://github.com/cc-mods/cc-agent-tools/blob/main/AGENTS.md). Most relevant here:
+- [`cc-tailsync.md`](https://github.com/cc-mods/cc-agent-tools/blob/main/cc-tailsync.md) — architecture,
   per-OS save paths, the server, `integrate-ios.sh`, the launchd/TCC gotcha, Windows Scheduled Task.
-- [`cc-ios.md`](https://github.com/cc-mods/cc-agentdocs/blob/main/cc-ios.md) — the `SaveSyncProvider`
+- [`cc-ios.md`](https://github.com/cc-mods/cc-agent-tools/blob/main/cc-ios.md) — the `SaveSyncProvider`
   seam this consumes.
 
-**When you learn something durable, add it to `cc-mods/cc-agentdocs`** and keep this pointer intact.
+**When you learn something durable, add it to `cc-mods/cc-agent-tools`** and keep this pointer intact.
 
 ## What this is
 
