@@ -3,6 +3,11 @@ cc-sync.json
 **/cc-sync.json
 cc-endpoints.json
 **/cc-endpoints.json
+# GitHub-hub config (holds a fine-grained PAT) + its per-device sync state — NEVER commit.
+cc-github.json
+**/cc-github.json
+cc-github-state.json
+**/cc-github-state.json
 
 # ---- CrossCode save files / game data (never commit personal saves or game assets) ----
 *.save
