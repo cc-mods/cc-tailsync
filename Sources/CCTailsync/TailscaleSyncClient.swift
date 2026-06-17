@@ -81,13 +81,35 @@ public final class TailscaleSyncClient {
         }
     }
 
-    /// Two-way sync with the server, resolving by modification time with a content-hash
-    /// short-circuit. Calls back `true` only if the local save file was updated from the server
-    /// (the caller should then load it).
+    /// The launch-sync policy. **Phone-authoritative**: the device's own save is the source of truth
+    /// and is NEVER overwritten from the server on launch. We only adopt the server's save when there
+    /// is no local save at all (a fresh install or a post-restore device) — the first-run seed.
+    /// Otherwise the local save wins and is pushed up if the server differs.
     ///
-    /// Resolution: identical hashes → nothing to do; otherwise the side with the newer mtime wins —
-    /// a newer **remote** is pulled, a newer **local** is pushed. This avoids clobbering progress
-    /// made offline on either side.
+    /// This deliberately drops the old "newer mtime wins" comparison: `remoteMtime` is the **server
+    /// machine's** clock and `localMtime` is the **phone's** clock, so any skew could make an older
+    /// server save look "newer" and silently clobber fresh on-device progress at launch. Comparing two
+    /// devices' wall clocks to decide a destructive overwrite is never safe. (A future, safer two-way
+    /// design uses a content SHA + an explicit "newer save detected — load? Y/N" prompt; see the
+    /// GitHub-hub client.)
+    enum PullAction: Equatable {
+        case seedFromServer(sha: String)  // no local save → take the server's
+        case pushLocal                    // local save wins → upload it (server missing or differs)
+        case inSync                       // local == server → nothing to do
+        case noRemoteNoLocal              // neither side has a save → nothing to do
+    }
+
+    /// Pure resolver for the phone-authoritative policy (no I/O — unit-tested directly).
+    static func resolvePull(localSha: String?, remoteExists: Bool, remoteSha: String) -> PullAction {
+        guard let localSha = localSha else {
+            return remoteExists ? .seedFromServer(sha: remoteSha) : .noRemoteNoLocal
+        }
+        if remoteExists && remoteSha == localSha { return .inSync }
+        return .pushLocal
+    }
+
+    /// Launch sync against the server, applying the phone-authoritative policy above. Calls back
+    /// `true` only if the local save file was seeded from the server (the caller should then load it).
     public func pullIfNewer(completion: @escaping (Bool) -> Void) {
         guard let config = loadConfig() else { completion(false); return }
         var request = URLRequest(url: config.url.appendingPathComponent("status"))
@@ -103,25 +125,20 @@ public final class TailscaleSyncClient {
             }
             let remoteExists = (obj["exists"] as? Bool) == true
             let remoteSha = obj["sha256"] as? String ?? ""
-            let remoteMtime = (obj["mtime"] as? Int) ?? 0
 
-            // Nothing on the server → upload whatever we have locally.
-            if !remoteExists {
+            switch Self.resolvePull(localSha: local?.sha, remoteExists: remoteExists, remoteSha: remoteSha) {
+            case .seedFromServer(let sha):
+                // No local save (fresh install / restore): adopt the server's. This is the ONLY path
+                // that writes the local file from the server, and only when there's nothing to lose.
+                self.downloadSave(config: config, expectedSha: sha, completion: completion)
+            case .pushLocal:
+                // Local save is authoritative and differs from (or is missing on) the server → upload.
                 if let value = local?.value { self.push(value) }
-                completion(false); return
-            }
-            // Nothing locally → take the server's save.
-            guard let local = local else {
-                self.downloadSave(config: config, expectedSha: remoteSha, completion: completion)
-                return
-            }
-            // In sync already.
-            if local.sha == remoteSha { self.lastSyncedSha = remoteSha; completion(false); return }
-            // Newer side wins.
-            if remoteMtime > local.mtime {
-                self.downloadSave(config: config, expectedSha: remoteSha, completion: completion)
-            } else {
-                self.push(local.value)
+                completion(false)
+            case .inSync:
+                self.lastSyncedSha = remoteSha
+                completion(false)
+            case .noRemoteNoLocal:
                 completion(false)
             }
         }.resume()

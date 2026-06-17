@@ -18,5 +18,6 @@ let package = Package(
     ],
     targets: [
         .target(name: "CCTailsync", path: "Sources/CCTailsync"),
+        .testTarget(name: "CCTailsyncTests", dependencies: ["CCTailsync"], path: "Tests/CCTailsyncTests"),
     ]
 )
