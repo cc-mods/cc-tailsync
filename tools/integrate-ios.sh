@@ -154,8 +154,12 @@ else
       echo "  package: github cc-mods/cc-tailsync (branch: $branch)"
     fi
   else
-    PKG_BLOCK=$'packages:\n  CCTailsync:\n    path: '"$repo_root"$'\n\n'
-    echo "  package: local path $repo_root"
+    # Local package: write a RELATIVE path (from app/ to the cc-tailsync repo) so project.yml never
+    # embeds a machine-specific absolute path like /Users/<name>/… — which must never be committed.
+    # xcodegen resolves package paths relative to the spec directory (app/).
+    rel_root="$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$repo_root" "$ios_repo/app")"
+    PKG_BLOCK=$'packages:\n  CCTailsync:\n    path: '"$rel_root"$'\n\n'
+    echo "  package: local path $rel_root (relative to app/)"
   fi
   export PKG_BLOCK
   edit_project_yml add
