@@ -94,8 +94,10 @@ import CCTailsync
 //
 // Wires cc-tailsync's GitHubSaveSyncClient (the always-online, content-SHA, versioned hub) into
 // cc-ios's SaveSync seam: as the launch/push provider AND the consent-pull provider (the "newer
-// save detected — load? Y/N" prompt). Dormant until Documents/cc-github.json (a fine-grained PAT)
-// exists — without it every call is a silent no-op, so the app still runs fully standalone.
+// save detected — load? Y/N" prompt), AND the durable background-flush owner (a background
+// URLSession that finishes the upload even if the app is suspended/force-quit). Dormant until
+// Documents/cc-github.json (a fine-grained PAT) exists — without it every call is a silent no-op,
+// so the app still runs fully standalone.
 extension GitHubSaveSyncClient: SaveSyncProvider {}
 extension GitHubSaveSyncClient: ConsentPullProvider {}
 
@@ -105,6 +107,13 @@ enum SaveSyncBootstrap {
         let client = GitHubSaveSyncClient(saveFileURL: SaveBridge.saveFileURL)
         SaveSync.provider = client
         SaveSync.consentProvider = client
+        // Forward the app delegate's background-URLSession hand-back to the client's uploader, and
+        // recreate the background session now so iOS can reconnect any uploads that finished while
+        // the app was away.
+        SaveSync.backgroundEventsHandler = { identifier, completion in
+            client.handleBackgroundEvents(identifier: identifier, completion: completion)
+        }
+        client.reconnectBackgroundSession()
     }
 }
 SWIFT

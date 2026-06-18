@@ -42,6 +42,14 @@ public final class GitHubSaveSyncClient {
     /// `checkForConsentPull`, consumed by `applyPulledConsent`).
     private var pendingRemoteSha: String?
 
+    /// Durable background uploader (a background `URLSession`). Lazily built so merely constructing a
+    /// client never spins up a background session — only the explicit background paths
+    /// (`flushInBackground`, `reconnectBackgroundSession`, `handleBackgroundEvents`) do, which keeps
+    /// the unit tests (and any extra client instances) free of a process-wide session-identifier clash.
+    private lazy var backgroundUploader = BackgroundSaveUploader(
+        onSyncedSha: { [weak self] sha in self?.saveLastSyncedSha(sha) }
+    )
+
     public init(saveFileURL: URL, configURL: URL? = nil, stateURL: URL? = nil) {
         self.saveFileURL = saveFileURL
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -221,13 +229,73 @@ public final class GitHubSaveSyncClient {
         }
     }
 
+    // MARK: - Confirmed flush (deliberate exit: Close / Restart buttons)
+
+    /// Push the current local save and confirm the hub holds it, then call back on the main queue.
+    /// Used by the host's "Close Game" / "Restart Game" buttons, which it fully controls — so a brief,
+    /// bounded wait on the network before exiting/reloading is legitimate (the one place we block).
+    ///
+    /// Guarantees: the completion runs **exactly once** and **no later than `timeout`** (a dead
+    /// network must never trap the user in the app), and `true` is returned immediately when there is
+    /// nothing to do (unconfigured, no local save, or already in sync). `false` means "couldn't
+    /// confirm in time" — the caller proceeds anyway; the save is already safe on disk and the next
+    /// launch reconciles.
+    public func flush(timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
+        let latch = OnceFlag()
+        func finish(_ ok: Bool) { latch.run { DispatchQueue.main.async { completion(ok) } } }
+
+        guard isConfigured, let config = loadConfig(),
+              let localData = try? Data(contentsOf: saveFileURL), !localData.isEmpty else {
+            finish(true); return   // nothing to sync → never block the exit
+        }
+        // Hard upper bound, independent of the network stack's own timeouts.
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(false) }
+
+        let localSha = Self.gitBlobSha(localData)
+        // Fast path: this exact save was already confirmed on the hub (we just pushed it, or nothing
+        // changed since the last successful sync) → no round-trip, so exit/reload stays instant.
+        if localSha == loadLastSyncedSha() { finish(true); return }
+        fetchRemote { [weak self] remoteSha, _ in
+            guard let self = self else { finish(false); return }
+            if remoteSha == localSha {                       // hub already holds this exact save
+                self.saveLastSyncedSha(localSha); finish(true); return
+            }
+            self.put(config: config, content: localData, priorSha: remoteSha) { ok in finish(ok) }
+        }
+    }
+
+    // MARK: - Durable background flush (app suspension / termination)
+
+    /// Hand the latest save to the OS via a background `URLSession` so the upload completes even if the
+    /// app is suspended or force-quit. Returns immediately. Uses `lastSyncedSha` as the optimistic
+    /// lock (no in-process GET needed → nothing to cut short on suspension); if a PC advanced the hub
+    /// in the meantime the PUT 409s and is dropped, and the next launch reconciles (phone-authoritative).
+    /// No-op when unconfigured, when there's no local save, or when nothing changed since the last sync.
+    public func flushInBackground() {
+        guard isConfigured, let config = loadConfig(),
+              let localData = try? Data(contentsOf: saveFileURL), !localData.isEmpty else { return }
+        let localSha = Self.gitBlobSha(localData)
+        if localSha == loadLastSyncedSha() { return }   // unchanged since the last successful sync
+        backgroundUploader.enqueue(config: config, content: localData, priorSha: loadLastSyncedSha())
+    }
+
+    /// Recreate the background session at launch so iOS can reconnect any tasks that finished while the
+    /// app was away (and deliver their completion via `handleBackgroundEvents`). Call once on startup.
+    public func reconnectBackgroundSession() { backgroundUploader.reconnect() }
+
+    /// Forward `application(_:handleEventsForBackgroundURLSession:completionHandler:)` to the uploader.
+    public func handleBackgroundEvents(identifier: String, completion: @escaping () -> Void) {
+        backgroundUploader.handleEvents(identifier: identifier, completion: completion)
+    }
+
     // MARK: - HTTP plumbing
 
-    private func contentsURL(_ config: Config) -> URL {
+    static func contentsURL(_ config: Config) -> URL {
         URL(string: "https://api.github.com/repos/\(config.repo)/contents/\(config.path)")!
     }
 
-    private func contentsRequest(_ config: Config) -> URLRequest {
+    /// Base authorized request (GET-shaped) for the Contents API. PUT callers add the method + body.
+    static func authorizedRequest(_ config: Config) -> URLRequest {
         var request = URLRequest(url: contentsURL(config))
         request.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -235,10 +303,30 @@ public final class GitHubSaveSyncClient {
         return request
     }
 
+    /// The JSON body for a Contents-API PUT (create or update). Omit `priorSha` to create.
+    /// Shared by the in-process push and the durable background uploader so both speak identically.
+    static func putBody(content: Data, priorSha: String?) -> [String: Any] {
+        var body: [String: Any] = [
+            "message": "sync: cc.save \(ISO8601DateFormatter().string(from: Date()))",
+            "content": content.base64EncodedString(),
+            "committer": ["name": "cc-saves sync", "email": "ccsync@users.noreply.github.com"],
+        ]
+        if let priorSha = priorSha { body["sha"] = priorSha } // omit on create (firstPush)
+        return body
+    }
+
+    /// Extract the new blob sha from a Contents-API PUT response body (`content.sha`).
+    static func parsePutSha(_ data: Data?) -> String? {
+        guard let data = data,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let contentObj = obj["content"] as? [String: Any] else { return nil }
+        return contentObj["sha"] as? String
+    }
+
     /// GET the file; call back `(remoteBlobSha?, remoteContent?)` — both nil on a 404 or error.
     private func fetchRemote(completion: @escaping (String?, Data?) -> Void) {
         guard let config = loadConfig() else { completion(nil, nil); return }
-        session.dataTask(with: contentsRequest(config)) { data, response, _ in
+        session.dataTask(with: Self.authorizedRequest(config)) { data, response, _ in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard status == 200, let data = data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -255,24 +343,14 @@ public final class GitHubSaveSyncClient {
 
     private func put(config: Config, content: Data, priorSha: String?,
                      completion: @escaping (Bool) -> Void) {
-        var body: [String: Any] = [
-            "message": "sync: cc.save \(ISO8601DateFormatter().string(from: Date()))",
-            "content": content.base64EncodedString(),
-            "committer": ["name": "cc-saves sync", "email": "ccsync@users.noreply.github.com"],
-        ]
-        if let priorSha = priorSha { body["sha"] = priorSha } // omit on create (firstPush)
-
-        var request = contentsRequest(config)
+        var request = Self.authorizedRequest(config)
         request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        request.httpBody = try? JSONSerialization.data(withJSONObject: Self.putBody(content: content, priorSha: priorSha))
 
         session.dataTask(with: request) { [weak self] data, response, _ in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if (status == 200 || status == 201), let data = data,
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let contentObj = obj["content"] as? [String: Any],
-               let newSha = contentObj["sha"] as? String {
+            if (status == 200 || status == 201), let newSha = Self.parsePutSha(data) {
                 self?.saveLastSyncedSha(newSha)
                 completion(true)
             } else {
@@ -286,5 +364,19 @@ public final class GitHubSaveSyncClient {
         let sem = DispatchSemaphore(value: 0)
         put(config: config, content: content, priorSha: priorSha) { _ in sem.signal() }
         _ = sem.wait(timeout: .now() + 6)
+    }
+}
+
+/// A tiny thread-safe latch: runs the first `run` block and ignores the rest. Lets `flush` resolve via
+/// whichever fires first — the network callback or the timeout — without a double completion.
+final class OnceFlag {
+    private var fired = false
+    private let lock = NSLock()
+    func run(_ block: () -> Void) {
+        lock.lock()
+        let first = !fired
+        fired = true
+        lock.unlock()
+        if first { block() }
     }
 }
