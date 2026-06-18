@@ -115,7 +115,7 @@ function Invoke-Install {
     if ($PullIntervalSec -gt 0) {
         $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
             -RepetitionInterval (New-TimeSpan -Seconds $PullIntervalSec) `
-            -RepetitionDuration ([TimeSpan]::MaxValue)).Repetition
+            -RepetitionDuration (New-TimeSpan -Days 3650)).Repetition
     }
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
