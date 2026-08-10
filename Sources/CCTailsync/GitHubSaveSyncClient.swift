@@ -163,6 +163,17 @@ public final class GitHubSaveSyncClient {
             case .pushLocal, .firstPush:
                 if let value = localData { self.putBlocking(config: config, content: value, priorSha: remoteSha) }
             case .offerLoadRemote:
+                // Before treating this as a conflict, check whether the two files actually hold the
+                // SAME saves (same slots by content) — they routinely differ only in byte encoding or
+                // which save is the active autoslot (the phone and the PC serialize differently and each
+                // keeps its own autoslot). If the content sets match, it's not a real divergence: record
+                // the remote sha so we converge, and don't seed/prompt. This is what stops a
+                // cross-device "Keep Both" from re-conflicting on every launch.
+                if let local = localData, let remote = remoteContent,
+                   let lk = CCSave.contentKeys(of: local), let rk = CCSave.contentKeys(of: remote),
+                   lk == rk {
+                    if let sha = remoteSha { self.saveLastSyncedSha(sha) }
+                }
                 break   // a real divergence — left for the consent prompt, never auto-applied
             case .nothing:
                 break
@@ -189,6 +200,14 @@ public final class GitHubSaveSyncClient {
                                      lastSyncedSha: self.loadLastSyncedSha(),
                                      remoteBlobSha: remoteSha) {
             case .offerLoadRemote:
+                // Same saves, different bytes (encoding / active-autoslot) → not a real conflict.
+                // Record the remote sha so we converge instead of re-prompting forever, and don't offer.
+                if let local = localData, let remote = remoteContent,
+                   let lk = CCSave.contentKeys(of: local), let rk = CCSave.contentKeys(of: remote),
+                   lk == rk {
+                    if let sha = remoteSha { self.saveLastSyncedSha(sha) }
+                    completion(nil); return
+                }
                 if let content = remoteContent, let sha = remoteSha {
                     self.pendingRemoteSha = sha
                     completion(content)
@@ -211,6 +230,37 @@ public final class GitHubSaveSyncClient {
             NSLog("[cc-github] applyPulledConsent write failed: %@", error.localizedDescription)
             return false
         }
+    }
+
+    // MARK: - Keep both (slot-level merge)
+
+    /// Preview: one-line summaries of the saves the remote would add over the local one (drives the
+    /// conflict prompt). Empty if nothing would be added or inputs can't be read.
+    public func consentSummaries(forRemote data: Data) -> [String] {
+        guard let localData = try? Data(contentsOf: saveFileURL),
+              let result = SaveMerge.merge(localSave: localData, remoteSave: data) else { return [] }
+        return result.added.map { $0.summary }
+    }
+
+    /// Keep both: merge the remote's divergent slots into the local save (never clobbering it), write
+    /// the result, and return the merged bytes so the host can inject + reload. Also pushes the merged
+    /// save to the hub so BOTH saves are preserved there and the PC converges (the merge is idempotent,
+    /// so a re-run is harmless). Returns `nil` (and leaves the local save untouched) if no safe merge
+    /// was possible.
+    public func mergeConsent(_ data: Data) -> Data? {
+        guard let localData = try? Data(contentsOf: saveFileURL),
+              let result = SaveMerge.merge(localSave: localData, remoteSave: data) else { return nil }
+        do {
+            try result.merged.write(to: saveFileURL, options: .atomic)
+        } catch {
+            NSLog("[cc-github] mergeConsent write failed: %@", error.localizedDescription)
+            return nil
+        }
+        pendingRemoteSha = nil
+        // Push the merged (both-preserving) save so the hub + PC converge on it. Fire-and-forget; if the
+        // app dies first, didEnterBackground's flush or the next save/launch reconciles (idempotent).
+        if let merged = String(data: result.merged, encoding: .utf8) { push(merged) }
+        return result.merged
     }
 
     // MARK: - Push (on in-game save)
